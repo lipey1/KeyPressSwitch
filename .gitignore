@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Gerados localmente (enter.ico e re-gerado pelo build.py)
+enter.ico
+
+# Logs / temp
+*.log
+*.tmp
