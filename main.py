@@ -2,16 +2,22 @@
 KeyPress Switch - segura uma tecla pressionada enquanto estiver ativo.
 
 - Define uma keybind de "switch" (mouse OU teclado) que liga/desliga.
-- Define uma tecla do teclado que fica pressionada enquanto ativo.
+- Define uma tecla do teclado que fica pressionada (keydown) enquanto ativo.
 - Overlay fixo no canto superior esquerdo mostrando ATIVO/INATIVO e a tecla.
 """
 
+import io
 import json
+import math
 import os
+import queue
+import struct
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import wave
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -129,6 +135,61 @@ def pin_overlay_win32(hwnd: int) -> None:
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
     )
+
+
+def _build_beeps_wav(steps: list[tuple[int, int]], gap_ms: int = 40) -> bytes:
+    """Gera WAV em memoria com sequencia de bips (freq Hz, duracao ms)."""
+    rate = 22050
+    samples: list[int] = []
+    gap_n = int(rate * gap_ms / 1000)
+    fade = max(1, int(rate * 0.005))
+
+    for idx, (freq, ms) in enumerate(steps):
+        n = max(1, int(rate * ms / 1000))
+        for i in range(n):
+            t = i / rate
+            env = min(1.0, i / fade, (n - i) / fade)
+            val = int(32767 * 0.35 * env * math.sin(2 * math.pi * freq * t))
+            samples.append(val)
+        if idx < len(steps) - 1:
+            samples.extend([0] * gap_n)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+    return buf.getvalue()
+
+
+_sound_wavs: dict[bool, Path] = {}
+_sound_lock = threading.Lock()
+
+_ON_STEPS = [(740, 70), (988, 80), (1175, 100)]
+_OFF_STEPS = [(587, 80), (440, 90), (330, 130)]
+
+
+def _get_toggle_wav_path(active: bool) -> Path:
+    if active not in _sound_wavs:
+        steps = _ON_STEPS if active else _OFF_STEPS
+        path = Path(tempfile.gettempdir()) / f"keypress_sound_{'on' if active else 'off'}.wav"
+        path.write_bytes(_build_beeps_wav(steps))
+        _sound_wavs[active] = path
+    return _sound_wavs[active]
+
+
+def play_toggle_sound(active: bool) -> None:
+    """Som intuitivo: ascendentes = ligar, descendentes = desligar. Corta o anterior."""
+    if sys.platform != "win32":
+        return
+
+    import winsound
+
+    path = str(_get_toggle_wav_path(active))
+    with _sound_lock:
+        winsound.PlaySound(None, winsound.SND_PURGE)
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
 
 
 def write_app_ico(dest: Path | None = None) -> Path:
@@ -318,41 +379,71 @@ def normalize_kb(key) -> str:
     return str(key)
 
 
-class KeyHolder:
-    """Mantem uma tecla pressionada reenviando keydown (emula auto-repeat)."""
+class InputWorker:
+    """Thread unica para press/release — evita deadlock Listener+Controller no Windows."""
 
-    def __init__(self, interval: float = 0.03):
+    def __init__(self):
+        self._q: queue.Queue = queue.Queue()
         self._kb = keyboard.Controller()
-        self._interval = interval
-        self._thread = None
-        self._stop = threading.Event()
-        self._key = None
-
-    def start(self, key):
-        self.stop()
-        self._key = key
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._held_key = None
+        self._thread = threading.Thread(target=self._loop, name="keypress-input", daemon=True)
         self._thread.start()
 
-    def _run(self):
-        while not self._stop.is_set():
+    def _loop(self) -> None:
+        while True:
             try:
-                self._kb.press(self._key)
-            except Exception:
-                pass
-            time.sleep(self._interval)
+                cmd, key = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if cmd == "shutdown":
+                self._release()
+                return
+            if cmd == "press":
+                if self._held_key == key:
+                    continue
+                self._release()
+                self._held_key = key
+                try:
+                    self._kb.press(key)
+                except Exception:
+                    self._held_key = None
+            elif cmd == "release":
+                self._release()
 
-    def stop(self):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=0.5)
-            self._thread = None
-        if self._key is not None:
-            try:
-                self._kb.release(self._key)
-            except Exception:
-                pass
+    def _release(self) -> None:
+        if self._held_key is None:
+            return
+        try:
+            self._kb.release(self._held_key)
+        except Exception:
+            pass
+        self._held_key = None
+
+    def press_hold(self, key) -> None:
+        self._q.put(("press", key))
+
+    def release_hold(self) -> None:
+        self._q.put(("release", None))
+
+    def shutdown(self) -> None:
+        self._q.put(("shutdown", None))
+        self._thread.join(timeout=1.0)
+
+
+class KeyHolder:
+    """Enfileira press/release na InputWorker."""
+
+    def __init__(self, worker: InputWorker):
+        self._worker = worker
+
+    def start(self, key) -> None:
+        self._worker.press_hold(key)
+
+    def stop(self) -> None:
+        self._worker.release_hold()
+
+    def shutdown(self) -> None:
+        self._worker.shutdown()
 
 
 class App:
@@ -372,13 +463,15 @@ class App:
         self.capture = None          # None | "switch" | "hold"
         self.switch_down = False     # evita toggles repetidos (auto-repeat)
 
-        self.holder = KeyHolder()
+        self._last_tray_active = None
+        self._last_overlay_key = None
+        self._last_poll_key = None
+
+        self._input_worker = InputWorker()
+        self.holder = KeyHolder(self._input_worker)
         self.tray_icon = None
         self.in_tray = False
         self._closing = False
-        self._last_tray_active = None
-        self._overlay_tick = 0
-        self._last_overlay_key = None
 
         self._build_gui()
         self._build_overlay()
@@ -389,7 +482,7 @@ class App:
     # ---------------- GUI principal ----------------
     def _build_gui(self):
         self.root.title(APP_NAME)
-        self.root.geometry("380x330")
+        self.root.geometry("380x355")
         self.root.resizable(False, False)
         self._set_window_icon()
 
@@ -433,19 +526,28 @@ class App:
             command=self._toggle_overlay_visibility,
         ).grid(row=6, column=1, sticky="e")
 
+        self.play_sounds = tk.BooleanVar(value=False)
+        self.sound_enabled = False
+        ttk.Checkbutton(
+            frm,
+            text="Som ao ligar/desligar",
+            variable=self.play_sounds,
+            command=self._on_sound_toggle,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         self.lbl_hint = ttk.Label(
             frm, text="Configure as teclas e use o switch.", foreground="#666"
         )
-        self.lbl_hint.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.lbl_hint.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Button(
             frm, text="Minimizar para bandeja", command=self._hide_to_tray
-        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
-        ttk.Separator(frm).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        ttk.Separator(frm).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(12, 8))
 
         credit = ttk.Frame(frm)
-        credit.grid(row=10, column=0, columnspan=2, sticky="ew")
+        credit.grid(row=11, column=0, columnspan=2, sticky="ew")
         ttk.Label(credit, text=f"Criado por {AUTHOR_NAME}", foreground="#666").pack(
             side="left"
         )
@@ -460,8 +562,7 @@ class App:
         link.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_URL))
 
         frm.columnconfigure(0, weight=1)
-        self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
-        self.root.bind("<Unmap>", self._on_unmap)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_window_icon(self):
         try:
@@ -550,6 +651,10 @@ class App:
             self.overlay.withdraw()
         self._save_config()
 
+    def _on_sound_toggle(self):
+        self.sound_enabled = self.play_sounds.get()
+        self._save_config()
+
     # ---------------- Persistencia ----------------
     def _load_config(self):
         data = load_config_file()
@@ -569,6 +674,10 @@ class App:
         if "show_overlay" in data:
             self.show_overlay.set(bool(data["show_overlay"]))
 
+        if "play_sounds" in data:
+            self.play_sounds.set(bool(data["play_sounds"]))
+        self.sound_enabled = self.play_sounds.get()
+
         if self.show_overlay.get():
             self.overlay.deiconify()
             self.overlay.after(50, self._pin_overlay)
@@ -581,6 +690,7 @@ class App:
             "switch": serialize_switch(self.switch_type, self.switch_norm),
             "hold": serialize_kb_key(self.hold_key),
             "show_overlay": self.show_overlay.get(),
+            "play_sounds": self.play_sounds.get(),
         }
         save_config_file(data)
 
@@ -617,12 +727,6 @@ class App:
         self.root.after(100, lambda: self.root.attributes("-topmost", False))
         self.root.focus_force()
 
-    def _on_unmap(self, event):
-        if event.widget is not self.root or self.in_tray or self._closing:
-            return
-        if self.root.state() == "iconic":
-            self.root.after(50, self._hide_to_tray)
-
     def _tray_open(self, icon=None, item=None):
         self.root.after(0, self._restore_from_tray)
 
@@ -630,15 +734,18 @@ class App:
         self.root.after(0, self._on_close)
 
     def _update_tray_icon(self):
-        if self.tray_icon is None:
+        if self.tray_icon is None or not self.in_tray:
             return
         with self.lock:
             active = self.active
         if active == self._last_tray_active:
             return
         self._last_tray_active = active
-        self.tray_icon.icon = make_tray_icon(active)
-        self.tray_icon.title = f"{APP_NAME} — {'ATIVO' if active else 'INATIVO'}"
+        try:
+            self.tray_icon.icon = make_tray_icon(active)
+            self.tray_icon.title = f"{APP_NAME} — {'ATIVO' if active else 'INATIVO'}"
+        except Exception:
+            pass
 
     # ---------------- Captura de teclas ----------------
     def _set_capture(self, mode: str):
@@ -661,7 +768,14 @@ class App:
         self.mouse_listener.start()
 
     def _on_kb_press(self, key):
+        toggle = False
         with self.lock:
+            if (
+                self.active
+                and self.hold_key is not None
+                and normalize_kb(key) == normalize_kb(self.hold_key)
+            ):
+                return
             if self.capture == "switch":
                 self.switch_type = "keyboard"
                 self.switch_norm = normalize_kb(key)
@@ -673,10 +787,10 @@ class App:
                 self.hold_key = key
                 self.hold_label = key_to_label(key)
                 self.capture = None
-                # Se estava ativo, reinicia a segurar a nova tecla
-                if self.active:
-                    self.holder.start(self.hold_key)
+                restart = self.active
                 self.root.after(0, self._save_config)
+                if restart:
+                    self.root.after(0, self._restart_hold)
                 return
             if (
                 self.switch_type == "keyboard"
@@ -684,10 +798,18 @@ class App:
                 and not self.switch_down
             ):
                 self.switch_down = True
-                self._toggle_locked()
+                toggle = True
+        if toggle:
+            self._schedule_toggle()
 
     def _on_kb_release(self, key):
         with self.lock:
+            if (
+                self.active
+                and self.hold_key is not None
+                and normalize_kb(key) == normalize_kb(self.hold_key)
+            ):
+                return
             if (
                 self.switch_type == "keyboard"
                 and normalize_kb(key) == self.switch_norm
@@ -697,6 +819,7 @@ class App:
     def _on_mouse_click(self, x, y, button, pressed):
         if not pressed:
             return
+        toggle = False
         with self.lock:
             if self.capture == "switch":
                 self.switch_type = "mouse"
@@ -706,18 +829,41 @@ class App:
                 self.root.after(0, self._save_config)
                 return
             if self.switch_type == "mouse" and button == self.switch_norm:
-                self._toggle_locked()
+                toggle = True
+        if toggle:
+            self._schedule_toggle()
 
     # ---------------- Logica do switch ----------------
-    def _toggle_locked(self):
-        """Deve ser chamado com self.lock adquirido."""
-        if self.hold_key is None:
-            return
-        self.active = not self.active
-        if self.active:
-            self.holder.start(self.hold_key)
+    def _schedule_toggle(self):
+        with self.lock:
+            if self.hold_key is None:
+                return
+            self.active = not self.active
+            active = self.active
+            key = self.hold_key
+            sound = self.sound_enabled
+        self.root.after(0, lambda: self._apply_active_state(active, key, sound))
+
+    def _apply_active_state(self, active: bool, key, sound: bool):
+        with self.lock:
+            if self.active != active or self.hold_key != key:
+                return
+        if active:
+            self.holder.start(key)
         else:
             self.holder.stop()
+        if sound:
+            play_toggle_sound(active)
+        self._last_poll_key = None
+        self._last_overlay_key = None
+        self._last_tray_active = None
+
+    def _restart_hold(self):
+        with self.lock:
+            if not self.active or self.hold_key is None:
+                return
+            key = self.hold_key
+        self.holder.start(key)
 
     # ---------------- Loop de atualizacao da GUI ----------------
     def _poll(self):
@@ -734,12 +880,11 @@ class App:
         else:
             self.lbl_status.config(text="INATIVO", foreground="#888")
 
-        self._sync_overlay(active, hold_label)
-        self._update_tray_icon()
-
-        self._overlay_tick += 1
-        if self._overlay_tick % 40 == 0:
-            self._pin_overlay()
+        poll_key = (active, switch_label, hold_label)
+        if poll_key != self._last_poll_key:
+            self._last_poll_key = poll_key
+            self._sync_overlay(active, hold_label)
+            self._update_tray_icon()
 
         self.root.after(50, self._poll)
 
@@ -747,6 +892,7 @@ class App:
         self._closing = True
         self._save_config()
         self.holder.stop()
+        self.holder.shutdown()
         try:
             self.kb_listener.stop()
             self.mouse_listener.stop()
@@ -757,6 +903,10 @@ class App:
                 self.tray_icon.stop()
             except Exception:
                 pass
+        try:
+            self.root.quit()
+        except Exception:
+            pass
         self.root.destroy()
 
 

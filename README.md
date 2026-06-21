@@ -13,6 +13,7 @@ Utilitário para Windows que mantém uma tecla do teclado **pressionada** enquan
 - **Overlay** — widget fixo no canto superior esquerdo mostrando `ATIVO` / `INATIVO` e a tecla
 - **Bandeja do sistema** — minimiza para a setinha do Windows; ícone com bolinha verde (ativo) ou vermelha (inativo)
 - **Config persistente** — salva automaticamente em `%APPDATA%\KeyPressSwitch\config.json`
+- **Som ao ligar/desligar** — tons ascendentes (ativar) e descendentes (desativar), opcional
 - **Instância única** — não permite abrir dois apps ao mesmo tempo
 - **Executável portable** — build one-file com PyInstaller
 
@@ -58,8 +59,9 @@ dist\KeyPressSwitch.exe
 1. **Definir switch** — clique no botão e pressione a tecla ou botão do mouse que vai ligar/desligar
 2. **Definir tecla** — clique no botão e pressione a tecla que deve ficar segurada
 3. Use o switch no dia a dia; o status aparece na janela, no overlay e na bandeja
-4. **Minimizar para bandeja** — some da barra de tarefas e continua rodando na setinha
-5. Para encerrar de verdade: clique direito no ícone da bandeja → **Sair**
+4. **Minimizar para bandeja** — único jeito de ir para a setinha; some da barra de tarefas e continua rodando
+5. **X** ou minimizar normal → janela na barra de tarefas (não vai para a bandeja)
+6. Para encerrar de verdade: **X** (com janela aberta) ou bandeja → **Sair**
 
 ---
 
